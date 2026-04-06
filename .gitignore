@@ -1,0 +1,28 @@
+# SAM 대용량 모델 (별도 다운로드)
+models/sam_vit_h_4b8939.pth
+
+# PyInstaller 빌드 결과물
+build/
+dist/
+*.spec
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code 히스토리
+.history/
+
+# Claude Code 설정
+.claude/
+
+# 임시/출력 파일
+*.tmp
+*_temp.*
+*_enhanced.*
+*_compressed.*
+
+# OS
+.DS_Store
+Thumbs.db
