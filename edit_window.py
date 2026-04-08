@@ -94,11 +94,17 @@ def apply_postprocess(
     # 마스크를 크롭 영역에 맞게 슬라이싱
     mask_crop = mask_full[y1:y2, x1:x2]
 
-    # 흑백 + 20% 어둡게
+    # 배경: 흑백 + 20% 어둡게 (원래대로)
     gray = cropped.convert("L").convert("RGB")
     gray = ImageEnhance.Brightness(gray).enhance(0.8)
 
-    color_arr = np.array(cropped.convert("RGB"))
+    # 간판(컬러): 채도 + 대비 + 선명도 강화 → 색상이 팍 튀어나오게
+    color_img = cropped.convert("RGB")
+    color_img = ImageEnhance.Color(color_img).enhance(1.5)      # 채도 50% 업
+    color_img = ImageEnhance.Contrast(color_img).enhance(1.2)   # 대비 20% 업
+    color_img = ImageEnhance.Sharpness(color_img).enhance(1.3)  # 선명도 30% 업
+
+    color_arr = np.array(color_img)
     gray_arr = np.array(gray)
 
     # mask 크기 불일치 방지
@@ -174,9 +180,16 @@ class EditWindow(tk.Toplevel):
         self.image_path = image_path
         self.sam_manager = sam_manager
 
-        # 원본 이미지 로드
+        # 원본 이미지 로드 (EXIF orientation 자동 보정)
         try:
-            self.orig_img = Image.open(image_path).convert("RGB")
+            _raw = Image.open(image_path)
+            # EXIF orientation 적용 (폰 세로 사진 90도 회전 문제 방지)
+            try:
+                from PIL import ImageOps
+                _raw = ImageOps.exif_transpose(_raw)
+            except Exception:
+                pass
+            self.orig_img = _raw.convert("RGB")
         except Exception as e:
             messagebox.showerror("오류", f"이미지를 열 수 없습니다:\n{e}", parent=self)
             self.destroy()
@@ -231,9 +244,16 @@ class EditWindow(tk.Toplevel):
         # ── 되돌리기 히스토리 (최대 20단계) ──
         self._mask_history: list = []
 
+        # 화면 해상도 기준으로 캔버스 크기 동적 계산
+        # (툴바 130px + 우측패널 260px 제외, 여백 40px)
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        canvas_max_w = screen_w - 260 - 40
+        canvas_max_h = screen_h - 130 - 60
+
         # 스케일 계산
-        scale_x = CANVAS_MAX_W / self.orig_w
-        scale_y = CANVAS_MAX_H / self.orig_h
+        scale_x = canvas_max_w / self.orig_w
+        scale_y = canvas_max_h / self.orig_h
         self.scale = min(scale_x, scale_y, 1.0)
         self.canvas_w = int(self.orig_w * self.scale)
         self.canvas_h = int(self.orig_h * self.scale)
@@ -344,6 +364,17 @@ class EditWindow(tk.Toplevel):
 
         ttk.Separator(side, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
 
+        # ── 적용 / 취소 버튼 (우측 패널) ──
+        tk.Button(
+            side, text="✔ 적용 (16:9 크롭 저장)", command=self._on_apply,
+            bg="#2196F3", fg="white", font=("", 9, "bold"), width=18
+        ).pack(anchor=tk.W, pady=(0, 4))
+        tk.Button(
+            side, text="✖ 취소", command=self.destroy, width=18
+        ).pack(anchor=tk.W)
+
+        ttk.Separator(side, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+
         self.lbl_status = tk.Label(side, text="박스 모드로 간판을 드래그하세요", wraplength=140,
                                    justify=tk.LEFT, fg="gray")
         self.lbl_status.pack(anchor=tk.W)
@@ -354,18 +385,6 @@ class EditWindow(tk.Toplevel):
             fg="blue", font=("", 8)
         )
         self.lbl_device.pack(anchor=tk.W, pady=(4, 0))
-
-        # ── 하단 버튼 ──
-        bottom = tk.Frame(self)
-        bottom.pack(fill=tk.X, padx=4, pady=6)
-
-        tk.Button(
-            bottom, text="적용 (16:9 크롭 저장)", command=self._on_apply,
-            bg="#2196F3", fg="white", font=("", 10, "bold"), width=20
-        ).pack(side=tk.LEFT, padx=4)
-        tk.Button(
-            bottom, text="취소", command=self.destroy, width=8
-        ).pack(side=tk.LEFT)
 
     # ─────────────────────────── 렌더링 ─────────────────────────────
 
@@ -481,7 +500,12 @@ class EditWindow(tk.Toplevel):
             self._mask_history.pop(0)
 
     def _on_undo(self, event=None):
-        """한 단계 되돌리기 (Ctrl+Z 또는 버튼)"""
+        """한 단계 되돌리기 (Ctrl+Z 또는 버튼) — 키 반복 방지"""
+        import time
+        now = time.time()
+        if hasattr(self, '_last_undo_time') and now - self._last_undo_time < 0.3:
+            return  # 300ms 이내 중복 호출 무시 (키 반복 방지)
+        self._last_undo_time = now
         if not self._mask_history:
             self._update_status("되돌릴 내용 없음")
             return
