@@ -261,14 +261,14 @@ def search_quality_for_target(
     return best_q, best_data
 
 
-def compress_file_to_target(path: Path, profile: CompressionProfile, apply_enhance: bool = False, filter_mode: str = "outdoor") -> ResultItem:
+def compress_file_to_target(path: Path, profile: CompressionProfile, apply_enhance: bool = False, filter_mode: str = "outdoor", apply_watermark: bool = True) -> ResultItem:
     try:
         before = path.stat().st_size
         if profile.pass_threshold_bytes is not None and before <= profile.pass_threshold_bytes:
             # 용량이 작아서 압축은 건너뛰는 조건이지만,
             # 보정 통합 실행(apply_enhance=True)인 경우에는 최소한 보정은 수행한다.
             if apply_enhance:
-                return enhance_only_file(path, mode=filter_mode)
+                return enhance_only_file(path, mode=filter_mode, apply_watermark=apply_watermark)
             return ResultItem(
                 src_path=path,
                 status="pass",
@@ -332,7 +332,7 @@ def compress_file_to_target(path: Path, profile: CompressionProfile, apply_enhan
             # 압축 결과가 원본보다 크거나 이득이 없을 때도,
             # 보정 통합 실행인 경우에는 보정-only 결과를 남긴다.
             if apply_enhance:
-                return enhance_only_file(path, mode=filter_mode)
+                return enhance_only_file(path, mode=filter_mode, apply_watermark=apply_watermark)
             return ResultItem(
                 src_path=path,
                 status="pass",
@@ -342,8 +342,8 @@ def compress_file_to_target(path: Path, profile: CompressionProfile, apply_enhan
                 message="원본이 더 작음 → 건너뜀",
             )
 
-        # 내부 모드: 최종 이미지에 미세 워터마크 삽입 후 재인코딩
-        if filter_mode == "indoor":
+        # 워터마크 옵션이 켜져 있으면 최종 이미지에 미세 워터마크 삽입 후 재인코딩
+        if apply_watermark:
             wm = apply_watermark_subtle(final_pil)
             buf = io.BytesIO()
             wm.save(buf, "JPEG", quality=q, optimize=True, progressive=True)
@@ -362,7 +362,7 @@ def compress_file_to_target(path: Path, profile: CompressionProfile, apply_enhan
         return ResultItem(src_path=path, status="error", before_bytes=0, after_bytes=0, out_path=None, message=f"{e}\n{tb}")
 
 
-def enhance_only_file(path: Path, jpeg_quality: int = 90, mode: str = "outdoor") -> ResultItem:
+def enhance_only_file(path: Path, jpeg_quality: int = 90, mode: str = "outdoor", apply_watermark: bool = True) -> ResultItem:
     """리사이즈/압축 없이 보정만 적용. 저장: *_enhanced.jpg"""
     try:
         before = path.stat().st_size
@@ -373,8 +373,8 @@ def enhance_only_file(path: Path, jpeg_quality: int = 90, mode: str = "outdoor")
                 pass
             img = flatten_to_rgb(im)
         img = apply_portfolio_filter(img, mode=mode)
-        # 내부 모드: 보정 후 미세 워터마크 삽입
-        if mode == "indoor":
+        # 워터마크 옵션이 켜져 있으면 보정 후 미세 워터마크 삽입
+        if apply_watermark:
             img = apply_watermark_subtle(img)
         out_path = path.with_name(f"{path.stem}_enhanced.jpg")
         data = jpeg_bytes(img, jpeg_quality)
@@ -413,6 +413,7 @@ class App(tk.Tk):
         self.sam_manager: Optional["SAMManager"] = SAMManager() if SAM_AVAILABLE else None
         self._sam_temps: Dict[Path, Path] = {}   # original Path → temp Path
         self._file_index: Dict[Path, int] = {}   # process Path → 트리뷰 행 인덱스
+        self._sam_edits: Dict[Path, dict] = {}   # original Path → 편집 상태(마스크 등)
 
         if self.sam_manager is not None:
             threading.Thread(target=self._init_sam_model, daemon=True).start()
@@ -449,6 +450,11 @@ class App(tk.Tk):
         ttk.Label(mode_frame, text="보정 모드:").pack(side=tk.LEFT)
         ttk.Radiobutton(mode_frame, text="외부", value="outdoor", variable=self.filter_mode_var).pack(side=tk.LEFT)
         ttk.Radiobutton(mode_frame, text="내부", value="indoor", variable=self.filter_mode_var).pack(side=tk.LEFT)
+
+        # 워터마크 삽입 여부 (보정 모드와 독립, 기본값 ON)
+        self.apply_watermark_var = tk.BooleanVar(value=True)
+        self.chk_watermark = ttk.Checkbutton(top, text="워터마크 삽입", variable=self.apply_watermark_var)
+        self.chk_watermark.pack(side=tk.LEFT, padx=(12, 0))
 
         self.lbl_target = ttk.Label(top, text=self._profile_summary())
         self.lbl_target.pack(side=tk.RIGHT)
@@ -560,6 +566,7 @@ class App(tk.Tk):
             self.tree.delete(i)
         self._sam_temps.clear()
         self._file_index.clear()
+        self._sam_edits.clear()
         for idx, p in enumerate(self.files):
             try:
                 before = format_bytes(p.stat().st_size)
@@ -581,8 +588,10 @@ class App(tk.Tk):
         self.lbl_summary.config(text="처리 중...")
         apply_enhance = self.apply_enhance_var.get()
         mode = self.filter_mode_var.get()
+        apply_watermark = self.apply_watermark_var.get()
         mode_text = "외부" if mode == "outdoor" else "내부"
-        self._log(f"처리 시작 - {profile.label}" + (" + 보정" if apply_enhance else "") + f" (모드: {mode_text})")
+        wm_text = " + 워터마크" if apply_watermark else ""
+        self._log(f"처리 시작 - {profile.label}" + (" + 보정" if apply_enhance else "") + wm_text + f" (모드: {mode_text})")
 
         # SAM 임시 파일 적용: original → temp 매핑
         process_list = [self._sam_temps.get(p, p) for p in self.files]
@@ -590,11 +599,11 @@ class App(tk.Tk):
             self._file_index[proc_p] = idx
 
         def run(active_profile: CompressionProfile = profile, do_enhance: bool = apply_enhance,
-                filter_mode: str = mode, plist: List[Path] = process_list):
+                filter_mode: str = mode, do_watermark: bool = apply_watermark, plist: List[Path] = process_list):
             total_before = 0
             total_after = 0
             for idx, p in enumerate(plist, start=1):
-                res = compress_file_to_target(p, active_profile, apply_enhance=do_enhance, filter_mode=filter_mode)
+                res = compress_file_to_target(p, active_profile, apply_enhance=do_enhance, filter_mode=filter_mode, apply_watermark=do_watermark)
                 self.results.append(res)
                 if res.before_bytes:
                     total_before += res.before_bytes
@@ -617,19 +626,21 @@ class App(tk.Tk):
         self.progress.configure(value=0, maximum=max(1, len(self.files)))
         self.lbl_summary.config(text="보정 중...")
         mode = self.filter_mode_var.get()
+        apply_watermark = self.apply_watermark_var.get()
         mode_text = "외부" if mode == "outdoor" else "내부"
-        self._log(f"보정만 실행 (모드: {mode_text})")
+        wm_text = " + 워터마크" if apply_watermark else ""
+        self._log(f"보정만 실행{wm_text} (모드: {mode_text})")
 
         # SAM 임시 파일 적용
         process_list_e = [self._sam_temps.get(p, p) for p in self.files]
         for proc_p, idx in [(process_list_e[i], i) for i in range(len(process_list_e))]:
             self._file_index[proc_p] = idx
 
-        def run_enhance(filter_mode: str = mode, plist: List[Path] = process_list_e):
+        def run_enhance(filter_mode: str = mode, do_watermark: bool = apply_watermark, plist: List[Path] = process_list_e):
             total_before = 0
             total_after = 0
             for idx, p in enumerate(plist, start=1):
-                res = enhance_only_file(p, mode=filter_mode)
+                res = enhance_only_file(p, mode=filter_mode, apply_watermark=do_watermark)
                 self.results.append(res)
                 if res.before_bytes:
                     total_before += res.before_bytes
@@ -782,18 +793,23 @@ class App(tk.Tk):
             return
 
         original_path = self.files[idx]
-        EditWindow(self, original_path, self.sam_manager)
+        # 같은 사진을 다시 열면 직전 편집 내용을 이어받는다
+        EditWindow(self, original_path, self.sam_manager,
+                   prev_state=self._sam_edits.get(original_path))
 
-    def _receive_sam_result(self, original_path: Path, temp_path: Path) -> None:
+    def _receive_sam_result(self, original_path: Path, temp_path: Path,
+                            state: Optional[dict] = None) -> None:
         """SAM 편집 완료 → 메인 화면 트리뷰 업데이트"""
         idx = self._file_index.get(original_path)
         if idx is None:
             self._log(f"[SAM] 파일 인덱스를 찾을 수 없음: {original_path.name}")
             return
 
-        # 기존 temp 파일이 있으면 삭제
+        # 기존 temp 파일이 있으면 삭제.
+        # 단, 같은 사진을 다시 편집하면 편집창이 같은 경로에 덮어쓰므로
+        # old_temp == temp_path인 경우를 지우면 방금 저장한 결과가 날아간다.
         old_temp = self._sam_temps.get(original_path)
-        if old_temp and old_temp.exists():
+        if old_temp and old_temp != temp_path and old_temp.exists():
             try:
                 old_temp.unlink()
             except Exception:
@@ -801,6 +817,9 @@ class App(tk.Tk):
 
         self._sam_temps[original_path] = temp_path
         self._file_index[temp_path] = idx
+        # 편집 상태는 압축 후에도 남겨둔다 → 언제든 다시 열어 이어서 수정 가능
+        if state is not None:
+            self._sam_edits[original_path] = state
 
         # 트리뷰 행 업데이트
         iid = str(idx)
