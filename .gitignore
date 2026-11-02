@@ -5,6 +5,9 @@ models/sam_vit_h_4b8939.pth
 build/
 dist/
 *.spec
+# 단, 빌드 스펙은 남겨둔다 (다른 PC에서 exe를 다시 만들려면 필요)
+!PicCompress.spec
+!pic_compress_20260923.spec
 
 # Python 캐시
 __pycache__/
